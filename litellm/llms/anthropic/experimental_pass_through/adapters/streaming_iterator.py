@@ -3,7 +3,16 @@
 import json
 import traceback
 from collections import deque
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterator, Literal, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+)
 
 from litellm import verbose_logger
 from litellm._uuid import uuid
@@ -53,6 +62,39 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         self.model = model
         # Mapping of truncated tool names to original names (for OpenAI's 64-char limit)
         self.tool_name_mapping = tool_name_mapping or {}
+
+    def _extract_tool_use_input_json_deltas(self, chunk: Any) -> List[Dict[str, Any]]:
+        """Return content_block_delta events carrying tool_call arguments from a chunk.
+
+        Some providers (e.g. Gemini) emit the full tool_call `arguments` payload in
+        the same streaming chunk that triggers the tool_use content block. The trigger
+        chunk itself is swallowed by the start-new-block branch, so those arguments
+        must be re-emitted here as `input_json_delta` deltas or the client receives
+        an empty `input: {}` on tool_use.
+        """
+        deltas: List[Dict[str, Any]] = []
+        if self.current_content_block_type != "tool_use":
+            return deltas
+        for choice in getattr(chunk, "choices", []) or []:
+            tool_calls = getattr(getattr(choice, "delta", None), "tool_calls", None)
+            if not tool_calls:
+                continue
+            for tc in tool_calls:
+                func = getattr(tc, "function", None)
+                args = getattr(func, "arguments", None) if func is not None else None
+                if not args:
+                    continue
+                deltas.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": self.current_content_block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": args,
+                        },
+                    }
+                )
+        return deltas
 
     def _create_initial_usage_delta(self) -> UsageDelta:
         """
@@ -129,8 +171,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                 if should_start_new_block and not self.sent_content_block_finish:
                     # Queue the sequence: content_block_stop -> content_block_start
-                    # The trigger chunk itself is not emitted as a delta since the
-                    # content_block_start already carries the relevant information.
+                    # For tool_use, also forward any `arguments` carried by the
+                    # trigger chunk as `input_json_delta` — providers that emit
+                    # the full tool-call payload in a single chunk (e.g. Gemini)
+                    # would otherwise leave `input: {}` on the client side.
                     self.chunk_queue.append(
                         {
                             "type": "content_block_stop",
@@ -144,6 +188,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             "content_block": self.current_content_block_start,
                         }
                     )
+                    for delta in self._extract_tool_use_input_json_deltas(chunk):
+                        self.chunk_queue.append(delta)
                     self.sent_content_block_finish = False
                     return self.chunk_queue.popleft()
 
@@ -282,16 +328,16 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         hasattr(chunk.usage, "_cache_creation_input_tokens")
                         and chunk.usage._cache_creation_input_tokens > 0
                     ):
-                        usage_dict[
-                            "cache_creation_input_tokens"
-                        ] = chunk.usage._cache_creation_input_tokens
+                        usage_dict["cache_creation_input_tokens"] = (
+                            chunk.usage._cache_creation_input_tokens
+                        )
                     if (
                         hasattr(chunk.usage, "_cache_read_input_tokens")
                         and chunk.usage._cache_read_input_tokens > 0
                     ):
-                        usage_dict[
-                            "cache_read_input_tokens"
-                        ] = chunk.usage._cache_read_input_tokens
+                        usage_dict["cache_read_input_tokens"] = (
+                            chunk.usage._cache_read_input_tokens
+                        )
                     merged_chunk["usage"] = usage_dict
 
                     # Queue the merged chunk and reset
@@ -305,8 +351,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if not self.queued_usage_chunk:
                     if should_start_new_block and not self.sent_content_block_finish:
                         # Queue the sequence: content_block_stop -> content_block_start
-                        # The trigger chunk itself is not emitted as a delta since the
-                        # content_block_start already carries the relevant information.
+                        # For tool_use, also forward any `arguments` carried by the
+                        # trigger chunk as `input_json_delta` — providers that emit
+                        # the full tool-call payload in a single chunk (e.g. Gemini)
+                        # would otherwise leave `input: {}` on the client side.
 
                         # 1. Stop current content block
                         self.chunk_queue.append(
@@ -324,6 +372,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                                 "content_block": self.current_content_block_start,
                             }
                         )
+
+                        # 3. Forward tool_use args from the trigger chunk
+                        for delta in self._extract_tool_use_input_json_deltas(chunk):
+                            self.chunk_queue.append(delta)
 
                         # Reset state for new block
                         self.sent_content_block_finish = False
